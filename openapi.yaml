@@ -1,0 +1,524 @@
+openapi: 3.0.3
+info:
+  title: API de Órbita
+  version: 1.1.0
+  description: |
+    Capa REST de Supabase (PostgREST, Auth y Storage) para Órbita y la app Android Órbita Citas.
+    Todas las acciones son funciones `POST /rest/v1/rpc/<nombre>` que validan rol, estado y empalmes en la base.
+    Detalle y ejemplos en README.md.
+servers:
+  - url: https://{proyecto}.supabase.co
+    variables:
+      proyecto:
+        default: proyecto
+        description: Referencia del proyecto de Supabase.
+security:
+  - clavePublica: []
+    sesion: []
+
+components:
+  securitySchemes:
+    clavePublica:
+      type: apiKey
+      in: header
+      name: apikey
+      description: Clave pública (anon) del proyecto. Sin sesión no da acceso a datos.
+    sesion:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: access_token devuelto por /auth/v1/token.
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+    Slot:
+      type: object
+      required: [starts_at, ends_at]
+      properties:
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+    Slots:
+      type: array
+      minItems: 1
+      maxItems: 3
+      items: { $ref: '#/components/schemas/Slot' }
+    Participante:
+      type: object
+      properties:
+        user_id: { $ref: '#/components/schemas/Uuid' }
+        role_label: { type: string, nullable: true }
+        required: { type: boolean }
+        response: { type: string, enum: [pendiente, aceptada, rechazada, cambio_solicitado] }
+        response_note: { type: string, nullable: true }
+        proposed_slots: { type: array, items: { $ref: '#/components/schemas/Slot' } }
+        attendance: { type: string, enum: [presente, ausente], nullable: true }
+    Cita:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Uuid' }
+        project_id: { type: string, format: uuid, nullable: true }
+        kind: { type: string, example: grabacion }
+        title: { type: string }
+        reason: { type: string, nullable: true }
+        status: { type: string, enum: [solicitada, programada, en_curso, realizada, incompleta, cancelada] }
+        modality: { type: string, enum: [presencial, virtual], nullable: true }
+        location: { type: string, nullable: true }
+        location_kind: { type: string, enum: [estudio, cliente, otro], nullable: true }
+        place_id: { type: string, format: uuid, nullable: true }
+        address: { type: string, nullable: true }
+        latitude: { type: number, nullable: true }
+        longitude: { type: number, nullable: true }
+        meeting_url: { type: string, nullable: true }
+        starts_at: { type: string, format: date-time, nullable: true }
+        ends_at: { type: string, format: date-time, nullable: true }
+        timezone: { type: string, example: America/Mexico_City }
+        proposed_slots: { type: array, items: { $ref: '#/components/schemas/Slot' } }
+        related_task_id: { type: string, format: uuid, nullable: true }
+        related_task_title: { type: string, nullable: true }
+        requested_by: { type: string, format: uuid, nullable: true }
+        coordinator_id: { type: string, format: uuid, nullable: true }
+        cancel_reason: { type: string, nullable: true }
+        close_note: { type: string, nullable: true }
+        participants:
+          type: array
+          items: { $ref: '#/components/schemas/Participante' }
+    Error:
+      type: object
+      properties:
+        code: { type: string, example: P0001 }
+        message: { type: string, example: Solo un administrador puede programar citas }
+
+  responses:
+    Uuid:
+      description: Identificador creado o afectado.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Uuid' }
+    SinContenido:
+      description: Listo.
+    ErrorDeRegla:
+      description: No se cumple una regla (rol, estado, datos o empalme). El mensaje viene en español.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    SinSesion:
+      description: Sin sesión o token vencido.
+
+paths:
+  /auth/v1/token:
+    post:
+      tags: [Sesión]
+      summary: Iniciar sesión (correo, Google o renovar)
+      security: [{ clavePublica: [] }]
+      parameters:
+        - in: query
+          name: grant_type
+          required: true
+          schema: { type: string, enum: [password, id_token, refresh_token] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [email, password]
+                  properties: { email: { type: string }, password: { type: string } }
+                - type: object
+                  required: [provider, id_token, nonce]
+                  properties: { provider: { type: string, enum: [google] }, id_token: { type: string }, nonce: { type: string } }
+                - type: object
+                  required: [refresh_token]
+                  properties: { refresh_token: { type: string } }
+      responses:
+        '200':
+          description: Sesión iniciada.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string }
+                  refresh_token: { type: string }
+                  expires_in: { type: integer }
+        '400': { description: Correo o contraseña incorrectos, o cuenta sin invitación. }
+
+  /rest/v1/appointments:
+    get:
+      tags: [Lecturas]
+      summary: Citas visibles para la persona
+      description: Admins ven todas; los demás, donde participan o que pidieron. Acepta filtros de PostgREST.
+      parameters:
+        - in: query
+          name: select
+          schema: { type: string, example: '*,participants:appointment_participants(*,user:users(id,full_name,role))' }
+        - in: query
+          name: order
+          schema: { type: string, example: starts_at.asc }
+      responses:
+        '200':
+          description: Lista de citas.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Cita' } }
+        '401': { $ref: '#/components/responses/SinSesion' }
+
+  /rest/v1/rpc/request_appointment:
+    post:
+      tags: [Citas]
+      summary: Solicitar una cita (cualquier usuario activo)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_kind, p_reason, p_slots]
+              properties:
+                p_project_id: { type: string, format: uuid, nullable: true }
+                p_kind: { type: string }
+                p_reason: { type: string, minLength: 3, maxLength: 2000 }
+                p_slots: { $ref: '#/components/schemas/Slots' }
+                p_location_kind: { type: string, enum: [estudio, cliente], description: Obligatorio si el tipo es presencial. }
+                p_place_id: { type: string, format: uuid }
+                p_address: { type: string }
+                p_lat: { type: number }
+                p_lng: { type: number }
+      responses:
+        '200': { $ref: '#/components/responses/Uuid' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/schedule_appointment:
+    post:
+      tags: [Citas]
+      summary: Programar o reprogramar una cita (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id, p_project_id, p_kind, p_title, p_starts, p_ends, p_modality, p_location, p_meeting_url, p_participants]
+              properties:
+                p_appointment_id: { type: string, format: uuid, nullable: true }
+                p_project_id: { type: string, format: uuid, nullable: true }
+                p_kind: { type: string }
+                p_title: { type: string }
+                p_starts: { type: string, format: date-time }
+                p_ends: { type: string, format: date-time }
+                p_modality: { type: string, enum: [presencial, virtual] }
+                p_location: { type: string, nullable: true }
+                p_meeting_url: { type: string, nullable: true, pattern: '^https://' }
+                p_participants:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [user_id]
+                    properties:
+                      user_id: { type: string, format: uuid }
+                      required: { type: boolean, default: true }
+                      role_label: { type: string }
+                p_related_task_id: { type: string, format: uuid, nullable: true }
+                p_location_kind: { type: string, enum: [estudio, cliente, otro] }
+                p_place_id: { type: string, format: uuid }
+                p_address: { type: string }
+                p_lat: { type: number }
+                p_lng: { type: number }
+      responses:
+        '200': { $ref: '#/components/responses/Uuid' }
+        '400':
+          description: Regla no cumplida, por ejemplo "CONFLICTO, Ana ya tiene otra cita en ese horario".
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /rest/v1/rpc/check_appointment_conflicts:
+    post:
+      tags: [Citas]
+      summary: Quién está ocupado en un horario (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_starts, p_ends, p_user_ids]
+              properties:
+                p_starts: { type: string, format: date-time }
+                p_ends: { type: string, format: date-time }
+                p_user_ids: { type: array, items: { type: string, format: uuid } }
+                p_exclude_appointment: { type: string, format: uuid, nullable: true }
+      responses:
+        '200':
+          description: Personas ocupadas.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    user_id: { type: string, format: uuid }
+                    full_name: { type: string }
+                    appointment_id: { type: string, format: uuid }
+                    appointment_title: { type: string }
+                    required_there: { type: boolean }
+
+  /rest/v1/rpc/respond_appointment:
+    post:
+      tags: [Citas]
+      summary: Aceptar, rechazar o proponer otro horario (invitado)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id, p_response]
+              properties:
+                p_appointment_id: { type: string, format: uuid }
+                p_response: { type: string, enum: [aceptada, rechazada, cambio_solicitado] }
+                p_note: { type: string, description: Obligatorio al rechazar. }
+                p_slots: { $ref: '#/components/schemas/Slots' }
+      responses:
+        '204': { $ref: '#/components/responses/SinContenido' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/resolve_change_request:
+    post:
+      tags: [Citas]
+      summary: Aceptar o rechazar el horario que propone un invitado (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id, p_user_id, p_accept]
+              properties:
+                p_appointment_id: { type: string, format: uuid }
+                p_user_id: { type: string, format: uuid }
+                p_accept: { type: boolean }
+                p_slot_index: { type: integer, minimum: 0, maximum: 2, default: 0 }
+                p_note: { type: string }
+      responses:
+        '204': { $ref: '#/components/responses/SinContenido' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/cancel_appointment:
+    post:
+      tags: [Citas]
+      summary: Cancelar (admin, o quien la pidió mientras está solicitada)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id, p_reason]
+              properties:
+                p_appointment_id: { type: string, format: uuid }
+                p_reason: { type: string, minLength: 3 }
+      responses:
+        '204': { $ref: '#/components/responses/SinContenido' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/start_appointment:
+    post:
+      tags: [Citas]
+      summary: Iniciar la cita (admin, desde una hora antes)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id]
+              properties:
+                p_appointment_id: { type: string, format: uuid }
+      responses:
+        '204': { $ref: '#/components/responses/SinContenido' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/set_appointment_attendance:
+    post:
+      tags: [Citas]
+      summary: Registrar asistencia a la cita (admin, cita en curso)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id, p_user_id, p_attendance]
+              properties:
+                p_appointment_id: { type: string, format: uuid }
+                p_user_id: { type: string, format: uuid }
+                p_attendance: { type: string, enum: [presente, ausente] }
+      responses:
+        '204': { $ref: '#/components/responses/SinContenido' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/add_appointment_agreement:
+    post:
+      tags: [Citas]
+      summary: Agregar un acuerdo (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id, p_body, p_visible_to_client]
+              properties:
+                p_appointment_id: { type: string, format: uuid }
+                p_body: { type: string, minLength: 2, maxLength: 1000 }
+                p_visible_to_client: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/Uuid' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/close_appointment:
+    post:
+      tags: [Citas]
+      summary: Cerrar la cita como realizada o incompleta (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id, p_status]
+              properties:
+                p_appointment_id: { type: string, format: uuid }
+                p_status: { type: string, enum: [realizada, incompleta] }
+                p_note: { type: string, description: Obligatorio si es incompleta. }
+      responses:
+        '204': { $ref: '#/components/responses/SinContenido' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/add_appointment_kind:
+    post:
+      tags: [Catálogos]
+      summary: Agregar un tipo de cita (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_label, p_default_modality]
+              properties:
+                p_label: { type: string, minLength: 2, maxLength: 40 }
+                p_default_modality: { type: string, enum: [presencial, virtual] }
+      responses:
+        '200':
+          description: Clave del tipo.
+          content:
+            application/json:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/add_appointment_place:
+    post:
+      tags: [Catálogos]
+      summary: Agregar un estudio o lugar de la agencia (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_name]
+              properties:
+                p_name: { type: string }
+                p_address: { type: string }
+                p_lat: { type: number }
+                p_lng: { type: number }
+      responses:
+        '200': { $ref: '#/components/responses/Uuid' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /rest/v1/rpc/register_appointment_file:
+    post:
+      tags: [Evidencia]
+      summary: Registrar un archivo de evidencia ya subido a Storage (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_appointment_id, p_path, p_file_name, p_mime_type, p_size_bytes, p_visible_to_client]
+              properties:
+                p_appointment_id: { type: string, format: uuid }
+                p_path: { type: string, example: '<cita>/<uuid>.jpg' }
+                p_file_name: { type: string }
+                p_mime_type: { type: string, enum: [image/jpeg, image/png, image/webp, image/heic, application/pdf] }
+                p_size_bytes: { type: integer, maximum: 10485760 }
+                p_visible_to_client: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/Uuid' }
+        '400': { $ref: '#/components/responses/ErrorDeRegla' }
+
+  /storage/v1/object/appointment-evidence/{ruta}:
+    post:
+      tags: [Evidencia]
+      summary: Subir foto o PDF al bucket privado (admin)
+      parameters:
+        - in: path
+          name: ruta
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          image/jpeg: { schema: { type: string, format: binary } }
+          application/pdf: { schema: { type: string, format: binary } }
+      responses:
+        '200': { description: Subido. }
+
+  /rest/v1/rpc/registrar_entrada:
+    post:
+      tags: [Asistencia]
+      summary: Registrar entrada (equipo y admins)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_location]
+              properties:
+                p_location: { type: string, enum: [oficina, home_office] }
+      responses:
+        '200': { description: Sesión de trabajo abierta (con retardo calculado). }
+
+  /rest/v1/rpc/registrar_salida:
+    post:
+      tags: [Asistencia]
+      summary: Registrar salida (equipo y admins)
+      responses:
+        '200': { description: Número de sesiones cerradas. }
+
+  /rest/v1/rpc/asistencia_rango:
+    post:
+      tags: [Asistencia]
+      summary: Asistencia por persona y día
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [p_from, p_to]
+              properties:
+                p_from: { type: string, format: date }
+                p_to: { type: string, format: date }
+                p_tolerancia: { type: integer, default: 5 }
+      responses:
+        '200':
+          description: Filas con estado a_tiempo, retardo, sin_registro, pendiente, descanso o dia_extra.
